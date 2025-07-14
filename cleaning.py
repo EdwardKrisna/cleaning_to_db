@@ -225,17 +225,25 @@ def create_geometry_column(df, lon_col, lat_col):
         # Create a copy to avoid modifying original
         df_copy = df.copy()
         
-        # Ensure lon/lat are numeric
+        # Ensure lon/lat are numeric (keep NaN values, don't coerce to NaN)
         df_copy[lon_col] = pd.to_numeric(df_copy[lon_col], errors='coerce')
         df_copy[lat_col] = pd.to_numeric(df_copy[lat_col], errors='coerce')
         
-        # Remove rows with invalid coordinates
-        valid_coords = df_copy[lon_col].notna() & df_copy[lat_col].notna()
-        df_copy = df_copy[valid_coords]
+        # Create geometry column with None for invalid coordinates
+        geometry = []
+        for lon, lat in zip(df_copy[lon_col], df_copy[lat_col]):
+            if pd.notna(lon) and pd.notna(lat):
+                geometry.append(Point(lon, lat))
+            else:
+                geometry.append(None)  # Keep blank/None for invalid coordinates
         
-        # Create geometry column
-        geometry = [Point(lon, lat) for lon, lat in zip(df_copy[lon_col], df_copy[lat_col])]
         df_copy['geometry'] = geometry
+        
+        # Count valid geometries
+        valid_geometries = sum(1 for geom in geometry if geom is not None)
+        total_rows = len(df_copy)
+        
+        st.info(f"🗺️ Geometry created: {valid_geometries} valid points out of {total_rows} total rows")
         
         return df_copy
     except Exception as e:
