@@ -171,25 +171,7 @@ def get_postgres_type(pandas_dtype):
     }
     return dtype_mapping.get(str(pandas_dtype), 'TEXT')
 
-def detect_coordinate_columns(df):
-    """Detect potential longitude and latitude columns"""
-    columns = df.columns.str.lower()
-    
-    # Common longitude column names
-    lon_patterns = ['lon', 'long', 'longitude', 'lng', 'x']
-    lat_patterns = ['lat', 'latitude', 'y']
-    
-    lon_col = None
-    lat_col = None
-    
-    for col in df.columns:
-        col_lower = col.lower()
-        if any(pattern in col_lower for pattern in lon_patterns):
-            lon_col = col
-        if any(pattern in col_lower for pattern in lat_patterns):
-            lat_col = col
-    
-    return lon_col, lat_col
+
 
 def create_geometry_column(df, lon_col, lat_col):
     """Create geometry column from longitude and latitude"""
@@ -267,18 +249,37 @@ def main():
                 # Data cleaning section
                 st.subheader("🧹 Data Cleaning")
                 
-                # Detect coordinate columns
-                lon_col, lat_col = detect_coordinate_columns(df)
+                # User selects coordinate columns for geometry creation
+                st.markdown("**🌍 Geometry Column Creation (Optional)**")
+                create_geometry = st.checkbox(
+                    "Create geometry column (EPSG:4326)",
+                    value=False,
+                    help="Creates a PostGIS geometry column from longitude and latitude"
+                )
                 
-                if lon_col and lat_col:
-                    st.info(f"🌍 Detected coordinate columns: **{lon_col}** (longitude) and **{lat_col}** (latitude)")
-                    create_geometry = st.checkbox(
-                        "Create geometry column (EPSG:4326)",
-                        value=True,
-                        help="Creates a PostGIS geometry column from longitude and latitude"
-                    )
-                else:
-                    create_geometry = False
+                lon_col = None
+                lat_col = None
+                
+                if create_geometry:
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        lon_col = st.selectbox(
+                            "Select Longitude Column",
+                            options=[None] + df.columns.tolist(),
+                            help="Choose the column containing longitude values"
+                        )
+                    with col2:
+                        lat_col = st.selectbox(
+                            "Select Latitude Column", 
+                            options=[None] + df.columns.tolist(),
+                            help="Choose the column containing latitude values"
+                        )
+                    
+                    if lon_col and lat_col:
+                        if lon_col == lat_col:
+                            st.error("⚠️ Longitude and latitude columns must be different!")
+                        else:
+                            st.success(f"✅ Will create geometry from **{lon_col}** (longitude) and **{lat_col}** (latitude)")
                 
                 col1, col2 = st.columns(2)
                 
@@ -316,6 +317,18 @@ def main():
                 # Apply cleaning
                 if st.button("🔄 Apply Cleaning", type="primary"):
                     try:
+                        # Validate geometry inputs
+                        if create_geometry:
+                            if not lon_col or not lat_col:
+                                st.error("⚠️ Please select both longitude and latitude columns for geometry creation")
+                                st.stop()
+                            if lon_col == lat_col:
+                                st.error("⚠️ Longitude and latitude columns must be different!")
+                                st.stop()
+                            if lon_col not in selected_columns or lat_col not in selected_columns:
+                                st.error("⚠️ Both coordinate columns must be selected in 'Columns to keep'")
+                                st.stop()
+                        
                         # Filter columns
                         cleaned_df = df[selected_columns].copy()
                         
@@ -331,7 +344,7 @@ def main():
                                 cleaned_df[col] = cleaned_df[col].astype(dtype)
                         
                         # Create geometry column if requested
-                        if create_geometry and lon_col and lat_col and lon_col in selected_columns and lat_col in selected_columns:
+                        if create_geometry and lon_col and lat_col:
                             with st.spinner("Creating geometry column..."):
                                 cleaned_df = create_geometry_column(cleaned_df, lon_col, lat_col)
                                 st.success("✅ Geometry column created successfully!")
