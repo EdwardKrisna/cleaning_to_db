@@ -274,74 +274,138 @@ def perform_spatial_intersection(df, db_manager, schema_name, lon_col, lat_col):
             st.warning("No valid geometries found for spatial intersection")
             return df_result
         
+        # Start a new transaction and rollback any pending transactions
+        try:
+            db_manager.connection.rollback()
+        except:
+            pass
+        
         # Create temporary table with valid geometries
         temp_table_name = f"temp_points_{int(pd.Timestamp.now().timestamp())}"
         
-        # Create GeoDataFrame for valid rows
-        gdf_temp = gpd.GeoDataFrame(
-            valid_rows.reset_index(), 
-            geometry='geometry', 
-            crs='EPSG:4326'
-        )
-        
-        # Upload temporary table to database
-        gdf_temp.to_postgis(
-            temp_table_name,
-            db_manager.engine,
-            schema=schema_name,
-            if_exists='replace',
-            index=False
-        )
-        
-        # Perform spatial intersection query
-        intersection_query = text(f"""
-            SELECT 
-                t.index as original_index,
-                w.WADMPR as wadmpr,
-                w.WADMKK as wadmkk, 
-                w.WADMKC as wadmkc,
-                w.WADMKD as wadmkd
-            FROM {schema_name}.{temp_table_name} t
-            LEFT JOIN {schema_name}.wadm_indonesia_ w 
-            ON ST_Intersects(t.geometry, w.geometry)
-        """)
-        
-        # Execute query and get results
-        intersection_results = pd.read_sql(intersection_query, db_manager.connection)
-        
-        # Update original dataframe with intersection results
-        for _, row in intersection_results.iterrows():
-            original_idx = row['original_index']
-            if original_idx < len(df_result):
-                df_result.loc[original_idx, 'wadmpr'] = row['wadmpr']
-                df_result.loc[original_idx, 'wadmkk'] = row['wadmkk']
-                df_result.loc[original_idx, 'wadmkc'] = row['wadmkc']
-                df_result.loc[original_idx, 'wadmkd'] = row['wadmkd']
-        
-        # Clean up temporary table
-        cleanup_query = text(f"DROP TABLE IF EXISTS {schema_name}.{temp_table_name}")
-        db_manager.connection.execute(cleanup_query)
-        db_manager.connection.commit()
-        
-        # Count successful intersections
-        successful_intersections = intersection_results['wadmpr'].notna().sum()
-        total_valid_points = len(valid_rows)
-        
-        st.success(f"🗺️ Spatial intersection completed: {successful_intersections} points matched out of {total_valid_points} valid coordinates")
+        try:
+            # Create GeoDataFrame for valid rows
+            gdf_temp = gpd.GeoDataFrame(
+                valid_rows.reset_index(), 
+                geometry='geometry', 
+                crs='EPSG:4326'
+            )
+            
+            # Upload temporary table to database
+            gdf_temp.to_postgis(
+                temp_table_name,
+                db_manager.engine,
+                schema=schema_name,
+                if_exists='replace',
+                index=False
+            )
+            
+            # Check if wadm_indonesia_ table exists
+            check_table_query = text(f"""
+                SELECT EXISTS (
+                    SELECT FROM information_schema.tables 
+                    WHERE table_schema = '{schema_name}' 
+                    AND table_name = 'wadm_indonesia_'
+                );
+            """)
+            
+            table_exists = db_manager.connection.execute(check_table_query).scalar()
+            
+            if not table_exists:
+                st.error("❌ Table 'wadm_indonesia_' not found in the database. Please ensure the administrative boundary table exists.")
+                return df_result
+            
+            # Check if required columns exist
+            check_columns_query = text(f"""
+                SELECT column_name 
+                FROM information_schema.columns 
+                WHERE table_schema = '{schema_name}' 
+                AND table_name = 'wadm_indonesia_'
+                AND column_name IN ('WADMPR', 'WADMKK', 'WADMKC', 'WADMKD', 'geometry');
+            """)
+            
+            existing_columns = [row[0] for row in db_manager.connection.execute(check_columns_query)]
+            required_columns = ['WADMPR', 'WADMKK', 'WADMKC', 'WADMKD', 'geometry']
+            missing_columns = [col for col in required_columns if col not in existing_columns]
+            
+            if missing_columns:
+                st.error(f"❌ Missing columns in 'wadm_indonesia_' table: {', '.join(missing_columns)}")
+                return df_result
+            
+            # Perform spatial intersection query
+            intersection_query = text(f"""
+                SELECT 
+                    t.index as original_index,
+                    w.WADMPR as wadmpr,
+                    w.WADMKK as wadmkk, 
+                    w.WADMKC as wadmkc,
+                    w.WADMKD as wadmkd
+                FROM {schema_name}.{temp_table_name} t
+                LEFT JOIN {schema_name}.wadm_indonesia_ w 
+                ON ST_Intersects(t.geometry, w.geometry)
+            """)
+            
+            # Execute query and get results
+            intersection_results = pd.read_sql(intersection_query, db_manager.connection)
+            
+            # Update original dataframe with intersection results
+            for _, row in intersection_results.iterrows():
+                original_idx = row['original_index']
+                if original_idx < len(df_result):
+                    df_result.loc[original_idx, 'wadmpr'] = row['wadmpr']
+                    df_result.loc[original_idx, 'wadmkk'] = row['wadmkk']
+                    df_result.loc[original_idx, 'wadmkc'] = row['wadmkc']
+                    df_result.loc[original_idx, 'wadmkd'] = row['wadmkd']
+            
+            # Count successful intersections
+            successful_intersections = intersection_results['wadmpr'].notna().sum()
+            total_valid_points = len(valid_rows)
+            
+            st.success(f"🗺️ Spatial intersection completed: {successful_intersections} points matched out of {total_valid_points} valid coordinates")
+            
+        finally:
+            # Clean up temporary table
+            try:
+                cleanup_query = text(f"DROP TABLE IF EXISTS {schema_name}.{temp_table_name}")
+                db_manager.connection.execute(cleanup_query)
+                db_manager.connection.commit()
+            except Exception as cleanup_error:
+                st.warning(f"Warning: Could not clean up temporary table: {cleanup_error}")
         
         return df_result
         
     except Exception as e:
+        # Rollback transaction on error
+        try:
+            db_manager.connection.rollback()
+        except:
+            pass
+        
         # Clean up temporary table in case of error
         try:
-            cleanup_query = text(f"DROP TABLE IF EXISTS {schema_name}.{temp_table_name}")
-            db_manager.connection.execute(cleanup_query)
-            db_manager.connection.commit()
+            if 'temp_table_name' in locals():
+                cleanup_query = text(f"DROP TABLE IF EXISTS {schema_name}.{temp_table_name}")
+                db_manager.connection.execute(cleanup_query)
+                db_manager.connection.commit()
         except:
             pass
         
         st.error(f"Error during spatial intersection: {str(e)}")
-        st.error("Please ensure 'wadm_indonesia_' table exists in your database with columns: WADMPR, WADMKK, WADMKC, WADMKD")
+        
+        # Provide more specific error messages
+        if "does not exist" in str(e):
+            st.error("❌ The 'wadm_indonesia_' table was not found. Please check:")
+            st.write("1. Table name is exactly 'wadm_indonesia_'")
+            st.write("2. Table is in the correct schema")
+            st.write("3. You have read permissions on the table")
+        elif "column" in str(e).lower():
+            st.error("❌ Required columns missing. Please ensure 'wadm_indonesia_' has:")
+            st.write("- WADMPR (Province)")
+            st.write("- WADMKK (Regency/City)")
+            st.write("- WADMKC (District)")
+            st.write("- WADMKD (Village)")
+            st.write("- geometry (Spatial column)")
+        
         return df
 
 def fix_mixed_types_for_display(df):
