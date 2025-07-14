@@ -246,15 +246,55 @@ def main():
                 st.subheader("📋 Raw Data Preview")
                 st.dataframe(df.head(10))
                 
+                # Display null/nan statistics
+                st.subheader("🔍 Data Quality Summary")
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    st.metric("Total Rows", len(df))
+                    st.metric("Total Columns", len(df.columns))
+                
+                with col2:
+                    # Calculate null statistics
+                    null_stats = df.isnull().sum()
+                    total_nulls = null_stats.sum()
+                    st.metric("Total Null Values", int(total_nulls))
+                    
+                    if total_nulls > 0:
+                        null_percentage = (total_nulls / (len(df) * len(df.columns))) * 100
+                        st.metric("Null Percentage", f"{null_percentage:.2f}%")
+                
+                # Show null values per column
+                if total_nulls > 0:
+                    st.markdown("**Null Values by Column:**")
+                    null_df = pd.DataFrame({
+                        'Column': df.columns,
+                        'Null Count': [df[col].isnull().sum() for col in df.columns],
+                        'Null %': [f"{(df[col].isnull().sum() / len(df)) * 100:.2f}%" for col in df.columns]
+                    })
+                    # Only show columns with null values
+                    null_df = null_df[null_df['Null Count'] > 0]
+                    if not null_df.empty:
+                        st.dataframe(null_df, hide_index=True)
+                    else:
+                        st.success("✅ No null values found in the dataset!")
+                else:
+                    st.success("✅ No null values found in the dataset!")
+                
                 # Data cleaning section
                 st.subheader("🧹 Data Cleaning")
+                
+                # Initialize session state for selected columns if not exists
+                if 'selected_columns_key' not in st.session_state:
+                    st.session_state.selected_columns_key = 0
                 
                 # User selects coordinate columns for geometry creation
                 st.markdown("**🌍 Geometry Column Creation (Optional)**")
                 create_geometry = st.checkbox(
                     "Create geometry column (EPSG:4326)",
                     value=False,
-                    help="Creates a PostGIS geometry column from longitude and latitude"
+                    help="Creates a PostGIS geometry column from longitude and latitude",
+                    key=f"create_geometry_{st.session_state.selected_columns_key}"
                 )
                 
                 lon_col = None
@@ -266,13 +306,15 @@ def main():
                         lon_col = st.selectbox(
                             "Select Longitude Column",
                             options=[None] + df.columns.tolist(),
-                            help="Choose the column containing longitude values"
+                            help="Choose the column containing longitude values",
+                            key=f"lon_col_{st.session_state.selected_columns_key}"
                         )
                     with col2:
                         lat_col = st.selectbox(
                             "Select Latitude Column", 
                             options=[None] + df.columns.tolist(),
-                            help="Choose the column containing latitude values"
+                            help="Choose the column containing latitude values",
+                            key=f"lat_col_{st.session_state.selected_columns_key}"
                         )
                     
                     if lon_col and lat_col:
@@ -289,71 +331,82 @@ def main():
                     selected_columns = st.multiselect(
                         "Select columns to keep",
                         options=available_columns,
-                        default=available_columns,
-                        help="Choose which columns to include in the final table"
+                        default=[],  # Start with empty selection
+                        help="Choose which columns to include in the final table",
+                        key=f"selected_columns_{st.session_state.selected_columns_key}"
                     )
                 
                 with col2:
                     st.markdown("**Data Type Configuration**")
-                    dtype_config = {}
                     
-                    for col in selected_columns:
-                        current_dtype = str(df[col].dtype)
-                        dtype_options = ['object', 'int64', 'float64', 'bool', 'datetime64[ns]']
+                    if selected_columns:
+                        dtype_config = {}
                         
-                        # Suggest float64 for coordinate columns
-                        if col == lon_col or col == lat_col:
-                            suggested_dtype = 'float64'
-                        else:
-                            suggested_dtype = current_dtype if current_dtype in dtype_options else 'object'
-                        
-                        dtype_config[col] = st.selectbox(
-                            f"Data type for '{col}'",
-                            options=dtype_options,
-                            index=dtype_options.index(suggested_dtype),
-                            key=f"dtype_{col}"
-                        )
-                
-                # Apply cleaning
-                if st.button("🔄 Apply Cleaning", type="primary"):
-                    try:
-                        # Validate geometry inputs
-                        if create_geometry:
-                            if not lon_col or not lat_col:
-                                st.error("⚠️ Please select both longitude and latitude columns for geometry creation")
-                                st.stop()
-                            if lon_col == lat_col:
-                                st.error("⚠️ Longitude and latitude columns must be different!")
-                                st.stop()
-                            if lon_col not in selected_columns or lat_col not in selected_columns:
-                                st.error("⚠️ Both coordinate columns must be selected in 'Columns to keep'")
-                                st.stop()
-                        
-                        # Filter columns
-                        cleaned_df = df[selected_columns].copy()
-                        
-                        # Apply data type changes
-                        for col, dtype in dtype_config.items():
-                            if dtype == 'datetime64[ns]':
-                                cleaned_df[col] = pd.to_datetime(cleaned_df[col], errors='coerce')
-                            elif dtype == 'bool':
-                                cleaned_df[col] = cleaned_df[col].astype('bool')
-                            elif dtype in ['int64', 'float64']:
-                                cleaned_df[col] = pd.to_numeric(cleaned_df[col], errors='coerce')
+                        for col in selected_columns:
+                            current_dtype = str(df[col].dtype)
+                            dtype_options = ['object', 'int64', 'float64', 'bool', 'datetime64[ns]']
+                            
+                            # Suggest float64 for coordinate columns
+                            if col == lon_col or col == lat_col:
+                                suggested_dtype = 'float64'
                             else:
-                                cleaned_df[col] = cleaned_df[col].astype(dtype)
-                        
-                        # Create geometry column if requested
-                        if create_geometry and lon_col and lat_col:
-                            with st.spinner("Creating geometry column..."):
-                                cleaned_df = create_geometry_column(cleaned_df, lon_col, lat_col)
-                                st.success("✅ Geometry column created successfully!")
-                        
-                        st.session_state.cleaned_df = cleaned_df
-                        st.success("✅ Data cleaning applied successfully!")
-                        
-                    except Exception as e:
-                        st.error(f"Error during cleaning: {str(e)}")
+                                suggested_dtype = current_dtype if current_dtype in dtype_options else 'object'
+                            
+                            dtype_config[col] = st.selectbox(
+                                f"Data type for '{col}'",
+                                options=dtype_options,
+                                index=dtype_options.index(suggested_dtype),
+                                key=f"dtype_{col}_{st.session_state.selected_columns_key}"
+                            )
+                    else:
+                        st.info("👆 Please select columns first")
+                        dtype_config = {}
+                
+                # Apply cleaning button - only show if columns are selected
+                if selected_columns:
+                    if st.button("🔄 Apply Cleaning", type="primary", key=f"apply_cleaning_{st.session_state.selected_columns_key}"):
+                        try:
+                            # Validate geometry inputs
+                            if create_geometry:
+                                if not lon_col or not lat_col:
+                                    st.error("⚠️ Please select both longitude and latitude columns for geometry creation")
+                                    st.stop()
+                                if lon_col == lat_col:
+                                    st.error("⚠️ Longitude and latitude columns must be different!")
+                                    st.stop()
+                                if lon_col not in selected_columns or lat_col not in selected_columns:
+                                    st.error("⚠️ Both coordinate columns must be selected in 'Columns to keep'")
+                                    st.stop()
+                            
+                            # Filter columns
+                            cleaned_df = df[selected_columns].copy()
+                            
+                            # Apply data type changes
+                            for col, dtype in dtype_config.items():
+                                if dtype == 'datetime64[ns]':
+                                    cleaned_df[col] = pd.to_datetime(cleaned_df[col], errors='coerce')
+                                elif dtype == 'bool':
+                                    cleaned_df[col] = cleaned_df[col].astype('bool')
+                                elif dtype in ['int64', 'float64']:
+                                    cleaned_df[col] = pd.to_numeric(cleaned_df[col], errors='coerce')
+                                else:
+                                    cleaned_df[col] = cleaned_df[col].astype(dtype)
+                            
+                            # Create geometry column if requested
+                            if create_geometry and lon_col and lat_col:
+                                with st.spinner("Creating geometry column..."):
+                                    cleaned_df = create_geometry_column(cleaned_df, lon_col, lat_col)
+                                    st.success("✅ Geometry column created successfully!")
+                            
+                            st.session_state.cleaned_df = cleaned_df
+                            st.session_state.selected_columns_key += 1  # Increment key to prevent rerun issues
+                            st.success("✅ Data cleaning applied successfully!")
+                            st.rerun()  # Rerun to show cleaned data section
+                            
+                        except Exception as e:
+                            st.error(f"Error during cleaning: {str(e)}")
+                else:
+                    st.info("👆 Please select at least one column to proceed with cleaning")
                 
                 # Display cleaned data
                 if 'cleaned_df' in st.session_state:
