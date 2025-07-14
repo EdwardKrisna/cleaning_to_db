@@ -250,6 +250,100 @@ def create_geometry_column(df, lon_col, lat_col):
         st.error(f"Error creating geometry column: {str(e)}")
         return df
 
+def perform_spatial_intersection(df, db_manager, schema_name, lon_col, lat_col):
+    """Perform spatial intersection with Indonesian administrative boundaries"""
+    try:
+        if 'geometry' not in df.columns:
+            st.error("Geometry column not found. Please create geometry column first.")
+            return df
+        
+        # Create a copy to work with
+        df_result = df.copy()
+        
+        # Initialize admin columns with None
+        df_result['wadmpr'] = None
+        df_result['wadmkk'] = None
+        df_result['wadmkc'] = None
+        df_result['wadmkd'] = None
+        
+        # Get valid geometries for intersection
+        valid_geom_mask = df_result['geometry'].notna()
+        valid_rows = df_result[valid_geom_mask].copy()
+        
+        if len(valid_rows) == 0:
+            st.warning("No valid geometries found for spatial intersection")
+            return df_result
+        
+        # Create temporary table with valid geometries
+        temp_table_name = f"temp_points_{int(pd.Timestamp.now().timestamp())}"
+        
+        # Create GeoDataFrame for valid rows
+        gdf_temp = gpd.GeoDataFrame(
+            valid_rows.reset_index(), 
+            geometry='geometry', 
+            crs='EPSG:4326'
+        )
+        
+        # Upload temporary table to database
+        gdf_temp.to_postgis(
+            temp_table_name,
+            db_manager.engine,
+            schema=schema_name,
+            if_exists='replace',
+            index=False
+        )
+        
+        # Perform spatial intersection query
+        intersection_query = text(f"""
+            SELECT 
+                t.index as original_index,
+                w.WADMPR as wadmpr,
+                w.WADMKK as wadmkk, 
+                w.WADMKC as wadmkc,
+                w.WADMKD as wadmkd
+            FROM {schema_name}.{temp_table_name} t
+            LEFT JOIN {schema_name}.wadm_indonesia_ w
+            ON ST_Intersects(t.geometry, w.geom)
+        """)
+        
+        # Execute query and get results
+        intersection_results = pd.read_sql(intersection_query, db_manager.connection)
+        
+        # Update original dataframe with intersection results
+        for _, row in intersection_results.iterrows():
+            original_idx = row['original_index']
+            if original_idx < len(df_result):
+                df_result.loc[original_idx, 'wadmpr'] = row['wadmpr']
+                df_result.loc[original_idx, 'wadmkk'] = row['wadmkk']
+                df_result.loc[original_idx, 'wadmkc'] = row['wadmkc']
+                df_result.loc[original_idx, 'wadmkd'] = row['wadmkd']
+        
+        # Clean up temporary table
+        cleanup_query = text(f"DROP TABLE IF EXISTS {schema_name}.{temp_table_name}")
+        db_manager.connection.execute(cleanup_query)
+        db_manager.connection.commit()
+        
+        # Count successful intersections
+        successful_intersections = intersection_results['wadmpr'].notna().sum()
+        total_valid_points = len(valid_rows)
+        
+        st.success(f"🗺️ Spatial intersection completed: {successful_intersections} points matched out of {total_valid_points} valid coordinates")
+        
+        return df_result
+        
+    except Exception as e:
+        # Clean up temporary table in case of error
+        try:
+            cleanup_query = text(f"DROP TABLE IF EXISTS {schema_name}.{temp_table_name}")
+            db_manager.connection.execute(cleanup_query)
+            db_manager.connection.commit()
+        except:
+            pass
+        
+        st.error(f"Error during spatial intersection: {str(e)}")
+        st.error("Please ensure 'wadm_indonesia_' table exists in your database with columns: WADMPR, WADMKK, WADMKC, WADMKD")
+        return df
+
 def process_uploaded_file(uploaded_file):
     """Process uploaded file (only when file changes)"""
     if uploaded_file is None:
@@ -389,6 +483,17 @@ def main():
                         st.error("⚠️ Longitude and latitude columns must be different!")
                     else:
                         st.success(f"✅ Will create geometry from **{lon_col}** (longitude) and **{lat_col}** (latitude)")
+                        
+                        # Option for spatial intersection with Indonesian administrative boundaries
+                        perform_intersection = st.checkbox(
+                            "Add Indonesian administrative info (wadmpr, wadmkk, wadmkc, wadmkd)",
+                            value=False,
+                            help="Performs spatial intersection with 'wadm_indonesia_' table to get administrative boundary information"
+                        )
+                        
+                        if perform_intersection:
+                            st.info("🗺️ Will perform spatial intersection to get: Province, Regency/City, District, and Village information")
+                            st.warning("⚠️ Requires 'wadm_indonesia_' table in your database with columns: WADMPR, WADMKK, WADMKC, WADMKD")
             
             col1, col2 = st.columns(2)
             
@@ -411,7 +516,7 @@ def main():
                     'termin_pembayaran', 'fee_proposal', 'fee_kontrak', 'fee_penambahan', 
                     'fee_adendum', 'kurs', 'fee_asing', 'status_pekerjaan_text', 
                     'tgl_mulai_preins', 'tgl_mulai_postins', 'tgl_memulai_pekerjaan_preins', 
-                    'tgl_memulai_pekerjaan_postins'
+                    'tgl_memulai_pekerjaan_postins', 'wadmpr', 'wadmkk', 'wadmkc', 'wadmkd'
                 ]
                 
                 # Filter predefined columns that exist in the uploaded file
@@ -489,6 +594,17 @@ def main():
                             with st.spinner("Creating geometry column..."):
                                 cleaned_df = create_geometry_column(cleaned_df, lon_col, lat_col)
                                 st.success("✅ Geometry column created successfully!")
+                                
+                                # Perform spatial intersection if requested
+                                if 'perform_intersection' in locals() and perform_intersection:
+                                    with st.spinner("Performing spatial intersection with Indonesian administrative boundaries..."):
+                                        cleaned_df = perform_spatial_intersection(
+                                            cleaned_df, 
+                                            st.session_state.db_manager, 
+                                            st.secrets.get("database", {}).get('schema', 'public'),
+                                            lon_col, 
+                                            lat_col
+                                        )
                         
                         st.session_state.cleaned_df = cleaned_df
                         st.session_state.cleaning_applied = True
