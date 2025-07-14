@@ -302,8 +302,8 @@ def perform_spatial_intersection(df, db_manager, schema_name, lon_col, lat_col):
                 w.WADMKC as wadmkc,
                 w.WADMKD as wadmkd
             FROM {schema_name}.{temp_table_name} t
-            LEFT JOIN {schema_name}.wadm_indonesia_ w
-            ON ST_Intersects(t.geometry, w.geom)
+            LEFT JOIN {schema_name}.wadm_indonesia_ w 
+            ON ST_Intersects(t.geometry, w.geometry)
         """)
         
         # Execute query and get results
