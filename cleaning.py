@@ -395,10 +395,36 @@ def main():
             with col1:
                 st.markdown("**Column Selection**")
                 available_columns = df.columns.tolist()
+                
+                # Predefined columns to select by default
+                predefined_columns = [
+                    'sumber', 'pemberi_tugas', 'jenis_klien', 'kategori_klien_text', 
+                    'bidang_usaha_klien_text', 'no_kontrak', 'tgl_kontrak', 'tahun_kontrak', 
+                    'bulan_kontrak', 'nama_lokasi', 'alamat_lokasi', 'objek_penilaian', 
+                    'nama_objek', 'jenis_objek_text', 'kepemilikan', 'penilaian_ke', 
+                    'keterangan', 'dokumen_kepemilikan', 'status_objek_text', 
+                    'latitude_inspeksi', 'longitude_inspeksi', 'latitude', 'longitude', 
+                    'cabang_text', 'reviewer_approve_nilai_flag', 'jc_text', 'divisi', 
+                    'nama_pekerjaan', 'sektor_text', 'kategori_penugasan', 
+                    'kategori_klien_proyek', 'ojk', 'jenis_laporan', 'jenis_penugasan_text', 
+                    'tujuan_penugasan_text', 'mata_uang_penilaian', 'estimasi_waktu_angka', 
+                    'termin_pembayaran', 'fee_proposal', 'fee_kontrak', 'fee_penambahan', 
+                    'fee_adendum', 'kurs', 'fee_asing', 'status_pekerjaan_text', 
+                    'tgl_mulai_preins', 'tgl_mulai_postins', 'tgl_memulai_pekerjaan_preins', 
+                    'tgl_memulai_pekerjaan_postins'
+                ]
+                
+                # Filter predefined columns that exist in the uploaded file
+                default_selection = [col for col in predefined_columns if col in available_columns]
+                
+                # Show info about predefined columns
+                if default_selection:
+                    st.info(f"📋 {len(default_selection)} predefined columns found and auto-selected")
+                
                 selected_columns = st.multiselect(
                     "Select columns to keep",
                     options=available_columns,
-                    default=[],  # Start with empty selection
+                    default=default_selection,  # Use predefined columns as default
                     help="Choose which columns to include in the final table"
                 )
             
