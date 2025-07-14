@@ -252,6 +252,8 @@ def create_geometry_column(df, lon_col, lat_col):
 
 def perform_spatial_intersection(df, db_manager, schema_name, lon_col, lat_col):
     """Perform spatial intersection with Indonesian administrative boundaries"""
+    temp_table_name = None
+    
     try:
         if 'geometry' not in df.columns:
             st.error("Geometry column not found. Please create geometry column first.")
@@ -274,16 +276,13 @@ def perform_spatial_intersection(df, db_manager, schema_name, lon_col, lat_col):
             st.warning("No valid geometries found for spatial intersection")
             return df_result
         
-        # Start a new transaction and rollback any pending transactions
-        try:
-            db_manager.connection.rollback()
-        except:
-            pass
+        # Create a fresh connection to avoid transaction issues
+        fresh_engine = create_engine(f"postgresql://{db_manager.db_config['user']}:{db_manager.db_config['password']}@{db_manager.db_config['host']}:{db_manager.db_config['port']}/{db_manager.db_config['name']}")
         
-        # Create temporary table with valid geometries
-        temp_table_name = f"temp_points_{int(pd.Timestamp.now().timestamp())}"
-        
-        try:
+        with fresh_engine.begin() as conn:  # Use transaction context manager
+            # Create temporary table with valid geometries
+            temp_table_name = f"temp_points_{int(pd.Timestamp.now().timestamp())}"
+            
             # Create GeoDataFrame for valid rows
             gdf_temp = gpd.GeoDataFrame(
                 valid_rows.reset_index(), 
@@ -294,59 +293,55 @@ def perform_spatial_intersection(df, db_manager, schema_name, lon_col, lat_col):
             # Upload temporary table to database
             gdf_temp.to_postgis(
                 temp_table_name,
-                db_manager.engine,
+                fresh_engine,
                 schema=schema_name,
                 if_exists='replace',
                 index=False
             )
             
-            # Check if wadm_indonesia_ table exists
+            # Check if wadm_indonesia_ table exists and get column info
             check_table_query = text(f"""
-                SELECT EXISTS (
-                    SELECT FROM information_schema.tables 
-                    WHERE table_schema = '{schema_name}' 
-                    AND table_name = 'wadm_indonesia_'
-                );
+                SELECT column_name, data_type
+                FROM information_schema.columns 
+                WHERE table_schema = :schema_name 
+                AND table_name = 'wadm_indonesia_'
+                AND column_name IN ('WADMPR', 'WADMKK', 'WADMKC', 'WADMKD', 'geometry')
+                ORDER BY column_name;
             """)
             
-            table_exists = db_manager.connection.execute(check_table_query).scalar()
+            column_info = conn.execute(check_table_query, {'schema_name': schema_name}).fetchall()
             
-            if not table_exists:
-                st.error("❌ Table 'wadm_indonesia_' not found in the database. Please ensure the administrative boundary table exists.")
+            if not column_info:
+                st.error("❌ Table 'wadm_indonesia_' not found or missing required columns.")
+                st.write("Required columns: WADMPR, WADMKK, WADMKC, WADMKD, geometry")
                 return df_result
             
-            # Check if required columns exist
-            check_columns_query = text(f"""
-                SELECT column_name 
-                FROM information_schema.columns 
-                WHERE table_schema = '{schema_name}' 
-                AND table_name = 'wadm_indonesia_'
-                AND column_name IN ('WADMPR', 'WADMKK', 'WADMKC', 'WADMKD', 'geometry');
-            """)
-            
-            existing_columns = [row[0] for row in db_manager.connection.execute(check_columns_query)]
+            existing_columns = [row[0] for row in column_info]
             required_columns = ['WADMPR', 'WADMKK', 'WADMKC', 'WADMKD', 'geometry']
             missing_columns = [col for col in required_columns if col not in existing_columns]
             
             if missing_columns:
                 st.error(f"❌ Missing columns in 'wadm_indonesia_' table: {', '.join(missing_columns)}")
+                st.write(f"Found columns: {', '.join(existing_columns)}")
                 return df_result
             
-            # Perform spatial intersection query
+            st.info(f"✅ Found wadm_indonesia_ table with columns: {', '.join(existing_columns)}")
+            
+            # Perform spatial intersection query with proper column names
             intersection_query = text(f"""
                 SELECT 
                     t.index as original_index,
-                    w.WADMPR as wadmpr,
-                    w.WADMKK as wadmkk, 
-                    w.WADMKC as wadmkc,
-                    w.WADMKD as wadmkd
+                    w."WADMPR" as wadmpr,
+                    w."WADMKK" as wadmkk, 
+                    w."WADMKC" as wadmkc,
+                    w."WADMKD" as wadmkd
                 FROM {schema_name}.{temp_table_name} t
                 LEFT JOIN {schema_name}.wadm_indonesia_ w 
                 ON ST_Intersects(t.geometry, w.geometry)
             """)
             
             # Execute query and get results
-            intersection_results = pd.read_sql(intersection_query, db_manager.connection)
+            intersection_results = pd.read_sql(intersection_query, conn)
             
             # Update original dataframe with intersection results
             for _, row in intersection_results.iterrows():
@@ -363,48 +358,44 @@ def perform_spatial_intersection(df, db_manager, schema_name, lon_col, lat_col):
             
             st.success(f"🗺️ Spatial intersection completed: {successful_intersections} points matched out of {total_valid_points} valid coordinates")
             
-        finally:
-            # Clean up temporary table
-            try:
-                cleanup_query = text(f"DROP TABLE IF EXISTS {schema_name}.{temp_table_name}")
-                db_manager.connection.execute(cleanup_query)
-                db_manager.connection.commit()
-            except Exception as cleanup_error:
-                st.warning(f"Warning: Could not clean up temporary table: {cleanup_error}")
+            # Clean up temporary table within the same transaction
+            cleanup_query = text(f"DROP TABLE IF EXISTS {schema_name}.{temp_table_name}")
+            conn.execute(cleanup_query)
+            
+        # Close the fresh engine
+        fresh_engine.dispose()
         
         return df_result
         
     except Exception as e:
-        # Rollback transaction on error
-        try:
-            db_manager.connection.rollback()
-        except:
-            pass
-        
-        # Clean up temporary table in case of error
-        try:
-            if 'temp_table_name' in locals():
-                cleanup_query = text(f"DROP TABLE IF EXISTS {schema_name}.{temp_table_name}")
-                db_manager.connection.execute(cleanup_query)
-                db_manager.connection.commit()
-        except:
-            pass
-        
         st.error(f"Error during spatial intersection: {str(e)}")
         
+        # Try to clean up with a separate transaction if temp table was created
+        if temp_table_name:
+            try:
+                cleanup_engine = create_engine(f"postgresql://{db_manager.db_config['user']}:{db_manager.db_config['password']}@{db_manager.db_config['host']}:{db_manager.db_config['port']}/{db_manager.db_config['name']}")
+                with cleanup_engine.begin() as cleanup_conn:
+                    cleanup_query = text(f"DROP TABLE IF EXISTS {schema_name}.{temp_table_name}")
+                    cleanup_conn.execute(cleanup_query)
+                cleanup_engine.dispose()
+                st.info("🧹 Temporary table cleaned up")
+            except Exception as cleanup_error:
+                st.warning(f"Could not clean up temporary table {temp_table_name}: {cleanup_error}")
+        
         # Provide more specific error messages
-        if "does not exist" in str(e):
-            st.error("❌ The 'wadm_indonesia_' table was not found. Please check:")
+        if "column" in str(e).lower() and "does not exist" in str(e).lower():
+            st.error("❌ Column case sensitivity issue detected.")
+            st.write("The wadm_indonesia_ table columns should be:")
+            st.write("- WADMPR (uppercase)")
+            st.write("- WADMKK (uppercase)")  
+            st.write("- WADMKC (uppercase)")
+            st.write("- WADMKD (uppercase)")
+            st.write("- geometry (lowercase)")
+        elif "does not exist" in str(e):
+            st.error("❌ Please verify:")
             st.write("1. Table name is exactly 'wadm_indonesia_'")
             st.write("2. Table is in the correct schema")
             st.write("3. You have read permissions on the table")
-        elif "column" in str(e).lower():
-            st.error("❌ Required columns missing. Please ensure 'wadm_indonesia_' has:")
-            st.write("- WADMPR (Province)")
-            st.write("- WADMKK (Regency/City)")
-            st.write("- WADMKC (District)")
-            st.write("- WADMKD (Village)")
-            st.write("- geometry (Spatial column)")
         
         return df
 
