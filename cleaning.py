@@ -7,6 +7,8 @@ from sqlalchemy import create_engine, text
 import io
 from typing import Dict, Any, List, Optional
 import re
+from shapely.geometry import Point
+import geopandas as gpd
 
 # Page configuration
 st.set_page_config(
@@ -63,19 +65,38 @@ class DatabaseManager:
             return []
     
     def create_table_from_dataframe(self, df: pd.DataFrame, table_name: str, schema: str = None):
-        """Create table from DataFrame"""
+        """Create table from DataFrame with geometry support"""
         if not self.connection:
             return False
         
         try:
             schema = schema or self.db_config.get('schema', 'public')
-            df.to_sql(
-                table_name, 
-                self.engine, 
-                schema=schema,
-                if_exists='replace', 
-                index=False
-            )
+            
+            # Check if DataFrame has geometry column
+            has_geometry = 'geometry' in df.columns
+            
+            if has_geometry:
+                # Create GeoDataFrame for geometry support
+                gdf = gpd.GeoDataFrame(df, geometry='geometry', crs='EPSG:4326')
+                
+                # Create table with PostGIS support
+                gdf.to_postgis(
+                    table_name,
+                    self.engine,
+                    schema=schema,
+                    if_exists='replace',
+                    index=False
+                )
+            else:
+                # Regular DataFrame
+                df.to_sql(
+                    table_name, 
+                    self.engine, 
+                    schema=schema,
+                    if_exists='replace', 
+                    index=False
+                )
+            
             return True
         except Exception as e:
             st.error(f"Failed to create table: {str(e)}")
@@ -145,9 +166,53 @@ def get_postgres_type(pandas_dtype):
         'bool': 'BOOLEAN',
         'datetime64[ns]': 'TIMESTAMP',
         'object': 'TEXT',
-        'category': 'TEXT'
+        'category': 'TEXT',
+        'geometry': 'GEOMETRY(POINT, 4326)'
     }
     return dtype_mapping.get(str(pandas_dtype), 'TEXT')
+
+def detect_coordinate_columns(df):
+    """Detect potential longitude and latitude columns"""
+    columns = df.columns.str.lower()
+    
+    # Common longitude column names
+    lon_patterns = ['lon', 'long', 'longitude', 'lng', 'x']
+    lat_patterns = ['lat', 'latitude', 'y']
+    
+    lon_col = None
+    lat_col = None
+    
+    for col in df.columns:
+        col_lower = col.lower()
+        if any(pattern in col_lower for pattern in lon_patterns):
+            lon_col = col
+        if any(pattern in col_lower for pattern in lat_patterns):
+            lat_col = col
+    
+    return lon_col, lat_col
+
+def create_geometry_column(df, lon_col, lat_col):
+    """Create geometry column from longitude and latitude"""
+    try:
+        # Create a copy to avoid modifying original
+        df_copy = df.copy()
+        
+        # Ensure lon/lat are numeric
+        df_copy[lon_col] = pd.to_numeric(df_copy[lon_col], errors='coerce')
+        df_copy[lat_col] = pd.to_numeric(df_copy[lat_col], errors='coerce')
+        
+        # Remove rows with invalid coordinates
+        valid_coords = df_copy[lon_col].notna() & df_copy[lat_col].notna()
+        df_copy = df_copy[valid_coords]
+        
+        # Create geometry column
+        geometry = [Point(lon, lat) for lon, lat in zip(df_copy[lon_col], df_copy[lat_col])]
+        df_copy['geometry'] = geometry
+        
+        return df_copy
+    except Exception as e:
+        st.error(f"Error creating geometry column: {str(e)}")
+        return df
 
 def main():
     if not authenticate():
@@ -202,6 +267,19 @@ def main():
                 # Data cleaning section
                 st.subheader("🧹 Data Cleaning")
                 
+                # Detect coordinate columns
+                lon_col, lat_col = detect_coordinate_columns(df)
+                
+                if lon_col and lat_col:
+                    st.info(f"🌍 Detected coordinate columns: **{lon_col}** (longitude) and **{lat_col}** (latitude)")
+                    create_geometry = st.checkbox(
+                        "Create geometry column (EPSG:4326)",
+                        value=True,
+                        help="Creates a PostGIS geometry column from longitude and latitude"
+                    )
+                else:
+                    create_geometry = False
+                
                 col1, col2 = st.columns(2)
                 
                 with col1:
@@ -222,10 +300,16 @@ def main():
                         current_dtype = str(df[col].dtype)
                         dtype_options = ['object', 'int64', 'float64', 'bool', 'datetime64[ns]']
                         
+                        # Suggest float64 for coordinate columns
+                        if col == lon_col or col == lat_col:
+                            suggested_dtype = 'float64'
+                        else:
+                            suggested_dtype = current_dtype if current_dtype in dtype_options else 'object'
+                        
                         dtype_config[col] = st.selectbox(
                             f"Data type for '{col}'",
                             options=dtype_options,
-                            index=dtype_options.index(current_dtype) if current_dtype in dtype_options else 0,
+                            index=dtype_options.index(suggested_dtype),
                             key=f"dtype_{col}"
                         )
                 
@@ -245,6 +329,12 @@ def main():
                                 cleaned_df[col] = pd.to_numeric(cleaned_df[col], errors='coerce')
                             else:
                                 cleaned_df[col] = cleaned_df[col].astype(dtype)
+                        
+                        # Create geometry column if requested
+                        if create_geometry and lon_col and lat_col and lon_col in selected_columns and lat_col in selected_columns:
+                            with st.spinner("Creating geometry column..."):
+                                cleaned_df = create_geometry_column(cleaned_df, lon_col, lat_col)
+                                st.success("✅ Geometry column created successfully!")
                         
                         st.session_state.cleaned_df = cleaned_df
                         st.success("✅ Data cleaning applied successfully!")
@@ -275,8 +365,25 @@ def main():
                     })
                     st.dataframe(dtype_df)
                     
+                    # Show geometry info if present
+                    if 'geometry' in cleaned_df.columns:
+                        st.info("🗺️ **Geometry Column Created**: Ready for PostGIS operations with EPSG:4326 coordinate system")
+                        
+                        # Show coordinate range
+                        if lon_col and lat_col and lon_col in cleaned_df.columns and lat_col in cleaned_df.columns:
+                            col1, col2 = st.columns(2)
+                            with col1:
+                                st.metric("Longitude Range", f"{cleaned_df[lon_col].min():.6f} to {cleaned_df[lon_col].max():.6f}")
+                            with col2:
+                                st.metric("Latitude Range", f"{cleaned_df[lat_col].min():.6f} to {cleaned_df[lat_col].max():.6f}")
+                    
                     # Table creation
                     st.subheader("🗄️ Create Database Table")
+                    
+                    # Check if PostGIS is required
+                    needs_postgis = 'geometry' in cleaned_df.columns
+                    if needs_postgis:
+                        st.warning("⚠️ **PostGIS Required**: This table contains geometry data and requires PostGIS extension in your PostgreSQL database.")
                     
                     col1, col2 = st.columns(2)
                     with col1:
@@ -304,6 +411,8 @@ def main():
                                     schema_name
                                 ):
                                     st.success(f"✅ Table '{sanitized_name}' created successfully!")
+                                    if needs_postgis:
+                                        st.info("🗺️ Geometry column created with EPSG:4326 coordinate system")
                                     st.balloons()
                                 else:
                                     st.error("Failed to create table")
