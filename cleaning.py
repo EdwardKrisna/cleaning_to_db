@@ -344,6 +344,19 @@ def perform_spatial_intersection(df, db_manager, schema_name, lon_col, lat_col):
         st.error("Please ensure 'wadm_indonesia_' table exists in your database with columns: WADMPR, WADMKK, WADMKC, WADMKD")
         return df
 
+def fix_mixed_types_for_display(df):
+    """Fix mixed data types in object columns for Streamlit display"""
+    df_fixed = df.copy()
+    
+    for col in df_fixed.columns:
+        if df_fixed[col].dtype == 'object':
+            # Convert all values to strings to avoid Arrow serialization issues
+            df_fixed[col] = df_fixed[col].astype(str)
+            # Replace 'nan' strings with actual None for cleaner display
+            df_fixed[col] = df_fixed[col].replace('nan', None)
+    
+    return df_fixed
+
 def process_uploaded_file(uploaded_file):
     """Process uploaded file (only when file changes)"""
     if uploaded_file is None:
@@ -362,8 +375,11 @@ def process_uploaded_file(uploaded_file):
         try:
             with st.spinner("Reading Excel file..."):
                 df = pd.read_excel(uploaded_file)
+                # Fix data types for display
+                df_display = fix_mixed_types_for_display(df)
             
-            st.session_state.df = df
+            st.session_state.df = df  # Store original for processing
+            st.session_state.df_display = df_display  # Store display version
             st.session_state.current_file = file_id
             st.session_state.file_processed = True
             st.session_state.cleaned_df = None
@@ -412,7 +428,9 @@ def main():
         if df is not None:
             # Display raw data and analysis (always shown for uploaded file)
             st.subheader("📋 Raw Data Preview")
-            st.dataframe(df.head(10))
+            # Use display-safe version of the dataframe
+            df_display = st.session_state.get('df_display', fix_mixed_types_for_display(df))
+            st.dataframe(df_display.head(10))
             
             # Display null/nan statistics
             st.subheader("🔍 Data Quality Summary")
@@ -580,14 +598,22 @@ def main():
                         
                         # Apply data type changes
                         for col, dtype in dtype_config.items():
-                            if dtype == 'datetime64[ns]':
-                                cleaned_df[col] = pd.to_datetime(cleaned_df[col], errors='coerce')
-                            elif dtype == 'bool':
-                                cleaned_df[col] = cleaned_df[col].astype('bool')
-                            elif dtype in ['int64', 'float64']:
-                                cleaned_df[col] = pd.to_numeric(cleaned_df[col], errors='coerce')
-                            else:
-                                cleaned_df[col] = cleaned_df[col].astype(dtype)
+                            try:
+                                if dtype == 'datetime64[ns]':
+                                    cleaned_df[col] = pd.to_datetime(cleaned_df[col], errors='coerce')
+                                elif dtype == 'bool':
+                                    cleaned_df[col] = cleaned_df[col].astype('bool')
+                                elif dtype in ['int64', 'float64']:
+                                    cleaned_df[col] = pd.to_numeric(cleaned_df[col], errors='coerce')
+                                else:  # object type
+                                    # Ensure consistent string conversion for object columns
+                                    cleaned_df[col] = cleaned_df[col].astype(str)
+                                    # Replace 'nan' strings with None
+                                    cleaned_df[col] = cleaned_df[col].replace('nan', None)
+                            except Exception as e:
+                                st.warning(f"Warning: Could not convert column '{col}' to {dtype}. Keeping as object. Error: {str(e)}")
+                                # Fallback to string conversion for problematic columns
+                                cleaned_df[col] = cleaned_df[col].astype(str).replace('nan', None)
                         
                         # Create geometry column if requested
                         if create_geometry and lon_col and lat_col:
@@ -627,7 +653,9 @@ def main():
                 with col2:
                     st.metric("Columns", len(cleaned_df.columns))
                 
-                st.dataframe(cleaned_df.head(10))
+                # Fix display issues for cleaned data
+                cleaned_df_display = fix_mixed_types_for_display(cleaned_df)
+                st.dataframe(cleaned_df_display.head(10))
                 
                 # Data type summary
                 st.subheader("📊 Data Type Summary")
